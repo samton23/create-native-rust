@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "create",
+  "version": "0.2.0",
+  "game": "26.3",
+  "horizon": "cd627662525d07920c3ce828b72739ec1a86c4ad",
+  "mixins": "a2af5c0dd4117d51ecd70066ba7a00b4a2c10dab",
+  "hooks": 45
+}

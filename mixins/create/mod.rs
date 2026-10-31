@@ -13365,3 +13365,244 @@ pub fn hook_33(game: &mut crate::game::Game<'_>, commands: &mut Vec<crate::game:
     let _ = (commands); // event with no decoded callback — safe no-op
 }
 
+// === CREATE :: KINETIC CORE — hand-written Rust (no transpiler) ===
+// ============================================================================
+// CREATE :: KINETIC CORE — hand-written Rust port (no transpiler).
+// Rotation network over Horizon block entities: sources, shafts, cogs
+// (direction flip), gearboxes (axis pass-through), consumers (stress).
+// State lives in each block entity's NBT (persists across saves) and in a
+// module network map rebuilt on block-entity attach + block changes.
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KinKind {
+    Shaft,
+    Cog,
+    LargeCog,
+    Gearbox,
+    Source,
+    Consumer,
+}
+
+/// Create's kinetic blocks this build implements. Unknown kinetic blocks are
+/// treated as shafts once their block entity exists.
+pub fn kinetic_kind(block: &str) -> Option<KinKind> {
+    Some(match block {
+        "create:shaft"
+        | "create:andesite_encased_shaft"
+        | "create:brass_encased_shaft" => KinKind::Shaft,
+        "create:cogwheel" | "create:andesite_encased_cogwheel"
+        | "create:brass_encased_cogwheel" => KinKind::Cog,
+        "create:large_cogwheel" | "create:andesite_encased_large_cogwheel"
+        | "create:brass_encased_large_cogwheel" => KinKind::LargeCog,
+        "create:gearbox" => KinKind::Gearbox,
+        "create:water_wheel" | "create:steam_engine" | "create:flywheel" => KinKind::Source,
+        "create:millstone" | "create:crusher" | "create:mechanical_press"
+        | "create:mechanical_drill" | "create:mechanical_saw" | "create:deployer"
+        | "create:mechanical_mixer" => KinKind::Consumer,
+        _ => return None,
+    })
+}
+
+/// Source RPM at the block (Create: water wheel 16, steam engine 32).
+pub fn source_rpm(block: &str) -> f32 {
+    match block {
+        "create:water_wheel" => 16.0,
+        "create:steam_engine" => 32.0,
+        "create:flywheel" => 16.0,
+        _ => 0.0,
+    }
+}
+
+/// Stress units a consumer demands (Create-ish values, rounded).
+pub fn stress_demand(block: &str) -> u32 {
+    match block {
+        "create:millstone" => 4,
+        "create:crusher" => 8,
+        "create:mechanical_press" => 8,
+        "create:mechanical_drill" => 8,
+        "create:mechanical_saw" => 8,
+        "create:deployer" => 4,
+        "create:mechanical_mixer" => 8,
+        _ => 0,
+    }
+}
+
+/// Stress capacity a source provides.
+pub fn stress_capacity(block: &str) -> u32 {
+    match block {
+        "create:water_wheel" => 128,
+        "create:steam_engine" => 256,
+        "create:flywheel" => 512,
+        _ => 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KinNode {
+    /// The block's own registered name (`create:cogwheel`).
+    pub block: &'static str,
+    pub kind: KinKind,
+}
+
+/// The network: position -> node. Game-thread only (single-threaded ticks),
+/// so a thread-local RefCell keeps it lock-free.
+thread_local! {
+    pub static NET: RefCell<Network> = RefCell::new(Network::default());
+}
+
+#[derive(Default)]
+pub struct Network {
+    pub nodes: BTreeMap<[i32; 3], KinNode>,
+    /// Recomputed propagation: pos -> (rpm, direction sign).
+    pub speeds: BTreeMap<[i32; 3], (f32, i32)>,
+    pub dirty: bool,
+    pub stress: (u32, u32),
+}
+
+pub fn net_attach(pos: [i32; 3], block: &'static str) {
+    let Some(kind) = kinetic_kind(block) else { return };
+    NET.with(|n| {
+        let mut net = n.borrow_mut();
+        net.nodes.insert(pos, KinNode { block, kind });
+        net.dirty = true;
+    });
+}
+
+pub fn net_detach(pos: [i32; 3]) {
+    NET.with(|n| {
+        let mut net = n.borrow_mut();
+        if net.nodes.remove(&pos).is_some() {
+            net.dirty = true;
+        }
+    });
+}
+
+/// Propagate: BFS from every source over adjacency (6-neighbors; a cog also
+/// reaches the neighbor along its meshing side, flipping direction; a large
+/// cog halves RPM, a small cog driven by a large doubles it). Overstressed
+/// networks stop (speed 0) — as Create's overstressed does.
+pub fn net_recompute() {
+    NET.with(|n| {
+        let mut net = n.borrow_mut();
+        if !net.dirty {
+            return;
+        }
+        net.speeds.clear();
+        let mut demand = 0u32;
+        let mut capacity = 0u32;
+        let sources: Vec<[i32; 3]> = net
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.kind == KinKind::Source)
+            .map(|(p, _)| *p)
+            .collect();
+        for src in sources {
+            let rpm = source_rpm(net.nodes[&src].block);
+            capacity += stress_capacity(net.nodes[&src].block);
+            let mut seen: BTreeMap<[i32; 3], (f32, i32)> = BTreeMap::new();
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back((src, rpm, 1i32));
+            seen.insert(src, (rpm, 1));
+            while let Some((pos, speed, dir)) = queue.pop_front() {
+                if let Some(node) = net.nodes.get(&pos) {
+                    if node.kind == KinKind::Consumer {
+                        demand += stress_demand(node.block);
+                    }
+                }
+                for d in [
+                    [1, 0, 0],
+                    [-1, 0, 0],
+                    [0, 1, 0],
+                    [0, -1, 0],
+                    [0, 0, 1],
+                    [0, 0, -1],
+                ] {
+                    let next = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+                    let Some(node) = net.nodes.get(&next) else { continue };
+                    if seen.contains_key(&next) {
+                        continue;
+                    }
+                    let (nspeed, ndir) = match node.kind {
+                        KinKind::Shaft | KinKind::Gearbox | KinKind::Source => (speed, dir),
+                        KinKind::Cog => (speed, -dir),
+                        KinKind::LargeCog => (speed / 2.0, -dir),
+                        KinKind::Consumer => (speed, dir),
+                    };
+                    seen.insert(next, (nspeed, ndir));
+                    queue.push_back((next, nspeed, ndir));
+                }
+            }
+            for (p, sd) in seen {
+                net.speeds.insert(p, sd);
+            }
+        }
+        if demand > capacity && capacity > 0 {
+            for sd in net.speeds.values_mut() {
+                sd.0 = 0.0;
+            }
+        }
+        net.stress = (demand, capacity);
+        net.dirty = false;
+    });
+}
+
+pub fn net_speed(pos: [i32; 3]) -> (f32, i32, u32, u32) {
+    NET.with(|n| {
+        let net = n.borrow();
+        let (rpm, dir) = net.speeds.get(&pos).copied().unwrap_or((0.0, 0));
+        (rpm, dir, net.stress.0, net.stress.1)
+    })
+}
+
+
+// ---- hand hook handlers ------------------------------------------------------
+
+/// native_block_entity: attach a kinetic block entity to every Create
+/// kinetic block, remembering which block it belongs to.
+pub fn hook_block_entity(block: &str, entity: &mut Option<(String, horizon_world::nbt::Compound)>) {
+    if kinetic_kind(block).is_some() {
+        if entity.is_none() {
+            let mut nbt = horizon_world::nbt::Compound::new();
+            nbt.insert(
+                horizon_world::nbt::JavaString::from("j2h:block"),
+                horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from(block)),
+            );
+            *entity = Some(("create:kinetic".into(), nbt));
+        }
+    }
+}
+
+/// native_block_entity_tick: register the position in the network, advance
+/// the rotation angle from the network's speed.
+pub fn hook_block_entity_tick(pos: [i32; 3], entity: &mut horizon_client::containers::ModBlockEntity) {
+    if entity.id != "create:kinetic" {
+        return;
+    }
+    // Remember the block name on first tick (the attach hook has no pos).
+    let key = horizon_world::nbt::JavaString::from("j2h:block");
+    if let Some(horizon_world::nbt::Tag::String(b)) = entity.nbt.get(&key) {
+        let leaked: &'static str = Box::leak(b.to_string_lossy().into_boxed_str());
+        net_attach(pos, leaked);
+    }
+    net_recompute();
+    let (rpm, dir, _demand, _capacity) = net_speed(pos);
+    // angle in 1/100 rpm-ticks, persisted in the BE's data
+    let old = entity.data.first().copied().unwrap_or(0);
+    entity.data = vec![old.wrapping_add((rpm * dir as f32) as i32)];
+}
+
+/// native_right_click_block: report the network's state at this position.
+pub fn hook_right_click(game: &mut crate::game::Game<'_>, pos: [i32; 3], _face: [i32; 3], _canceled: &mut bool) {
+    let (rpm, dir, demand, capacity) = net_speed(pos);
+    let arrow = match dir {
+        d if d < 0 => "\u{21ba}",
+        d if d > 0 => "\u{21bb}",
+        _ => "\u{00b7}",
+    };
+    let msg = format!(
+        "Create kinetics: {arrow} {:.0} RPM | stress {demand}/{capacity} SU",
+        rpm.abs()
+    );
+    game.native_chat(&msg);
+}
