@@ -3,6 +3,5 @@ fn hook_block_entity_tick(
     pos: [i32; 3],
     entity: &mut horizon_client::containers::ModBlockEntity,
 ) {
-    let _ = game;
-    crate::game::create::hook_block_entity_tick(pos, entity);
+    crate::game::create::hook_block_entity_tick(game, pos, entity);
 }

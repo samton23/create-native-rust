@@ -186,3 +186,60 @@ pub fn net_speed(pos: [i32; 3]) -> (f32, i32, u32, u32) {
         (rpm, dir, net.stress.0, net.stress.1)
     })
 }
+
+
+// ============================================================================
+// v0.3: consumers process the world; tooltips from Create's lang.
+// ============================================================================
+
+/// Create's crushing chain, block to block (what the player SEES happen).
+pub fn crush_step(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "minecraft:stone" => "minecraft:cobblestone",
+        "minecraft:cobblestone" => "minecraft:gravel",
+        "minecraft:gravel" => "minecraft:sand",
+        "minecraft:sandstone" => "minecraft:sand",
+        "minecraft:iron_ore" => "minecraft:raw_iron_block",
+        "minecraft:deepslate_iron_ore" => "minecraft:raw_iron_block",
+        "minecraft:gold_ore" => "minecraft:raw_gold_block",
+        "minecraft:deepslate_gold_ore" => "minecraft:raw_gold_block",
+        "minecraft:copper_ore" => "minecraft:raw_copper_block",
+        "minecraft:deepslate_copper_ore" => "minecraft:raw_copper_block",
+        _ => return None,
+    })
+}
+
+/// Create's tooltip summaries for the kinetic blocks (en_us.json).
+pub fn tooltip_summary(item: &str) -> Option<&'static str> {
+    Some(match item {
+        "create:shaft" => "Relays rotation from one kinetic block to another.",
+        "create:cogwheel" => "Relays rotation and can change the axis of it, or mesh with other cogwheels.",
+        "create:large_cogwheel" => "A larger and more durable cogwheel. Changes the speed of a rotation network by 1:2.",
+        "create:gearbox" => "Relays rotation between its axis, and to the sides independently.",
+        "create:water_wheel" => "Generates rotational force from adjacent flowing water.",
+        "create:steam_engine" => "A source of rotational power, fueled by burning any fluid fuel and water.",
+        "create:millstone" => "Grinds what is placed beneath it while the network spins.",
+        "create:mechanical_drill" => "Breaks or crushes the block it faces while the network spins.",
+        "create:crusher" => "Crushes the block beneath it while the network spins.",
+        _ => return None,
+    })
+}
+
+/// The processing tick of a consumer: every 60 spinning ticks convert the
+/// block BELOW through the crushing chain (world read -> set_block).
+pub fn consumer_tick(ctx: &mut BridgeCtx, pos: [i32; 3], counter: &mut i32) {
+    let (rpm, _dir, demand, capacity) = net_speed(pos);
+    if rpm <= 0.0 || demand > capacity {
+        return;
+    }
+    *counter += 1;
+    if *counter < 60 {
+        return;
+    }
+    *counter = 0;
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    let name = ctx.block_name_at(below);
+    if let Some(next) = crush_step(&name) {
+        ctx.set_block_by_name(below, next);
+    }
+}

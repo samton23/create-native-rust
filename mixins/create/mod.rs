@@ -199,6 +199,31 @@ impl<'a, 'g> BridgeCtx<'a, 'g> {
         JvmVal::Null
     }
 
+    /// Block name at coords — REAL world read through Game
+    /// (`world.block(x,y,z)` + `res.facts().get(id).name`).
+    pub fn block_name_at(&mut self, pos: [i32; 3]) -> String {
+        match &mut self.game {
+            #[cfg(feature = "j2h-in-horizon")]
+            GameRef::Game(g) => {
+                let id = g.world.block(pos[0], pos[1], pos[2]);
+                g.res.facts().get(id).map(|f| f.name.clone()).unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Set a block BY NAME: registry.default_state -> native_set_block.
+    pub fn set_block_by_name(&mut self, pos: [i32; 3], name: &str) -> bool {
+        match &mut self.game {
+            #[cfg(feature = "j2h-in-horizon")]
+            GameRef::Game(g) => {
+                let Some(state) = g.pack.assets.registry.default_state(name) else { return false };
+                g.native_set_block(&self.dimension, pos, state, 3)
+            }
+            _ => false,
+        }
+    }
+
     /// `Level.setBlock(pos, state, flags)` — REAL: Horizon's
     /// `Game::native_set_block(dimension, pos, state, flags) -> bool`.
     pub fn set_block(&mut self, pos: [i32; 3], state: u32, flags: i32) -> bool {
@@ -13556,6 +13581,63 @@ pub fn net_speed(pos: [i32; 3]) -> (f32, i32, u32, u32) {
 }
 
 
+// ============================================================================
+// v0.3: consumers process the world; tooltips from Create's lang.
+// ============================================================================
+
+/// Create's crushing chain, block to block (what the player SEES happen).
+pub fn crush_step(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "minecraft:stone" => "minecraft:cobblestone",
+        "minecraft:cobblestone" => "minecraft:gravel",
+        "minecraft:gravel" => "minecraft:sand",
+        "minecraft:sandstone" => "minecraft:sand",
+        "minecraft:iron_ore" => "minecraft:raw_iron_block",
+        "minecraft:deepslate_iron_ore" => "minecraft:raw_iron_block",
+        "minecraft:gold_ore" => "minecraft:raw_gold_block",
+        "minecraft:deepslate_gold_ore" => "minecraft:raw_gold_block",
+        "minecraft:copper_ore" => "minecraft:raw_copper_block",
+        "minecraft:deepslate_copper_ore" => "minecraft:raw_copper_block",
+        _ => return None,
+    })
+}
+
+/// Create's tooltip summaries for the kinetic blocks (en_us.json).
+pub fn tooltip_summary(item: &str) -> Option<&'static str> {
+    Some(match item {
+        "create:shaft" => "Relays rotation from one kinetic block to another.",
+        "create:cogwheel" => "Relays rotation and can change the axis of it, or mesh with other cogwheels.",
+        "create:large_cogwheel" => "A larger and more durable cogwheel. Changes the speed of a rotation network by 1:2.",
+        "create:gearbox" => "Relays rotation between its axis, and to the sides independently.",
+        "create:water_wheel" => "Generates rotational force from adjacent flowing water.",
+        "create:steam_engine" => "A source of rotational power, fueled by burning any fluid fuel and water.",
+        "create:millstone" => "Grinds what is placed beneath it while the network spins.",
+        "create:mechanical_drill" => "Breaks or crushes the block it faces while the network spins.",
+        "create:crusher" => "Crushes the block beneath it while the network spins.",
+        _ => return None,
+    })
+}
+
+/// The processing tick of a consumer: every 60 spinning ticks convert the
+/// block BELOW through the crushing chain (world read -> set_block).
+pub fn consumer_tick(ctx: &mut BridgeCtx, pos: [i32; 3], counter: &mut i32) {
+    let (rpm, _dir, demand, capacity) = net_speed(pos);
+    if rpm <= 0.0 || demand > capacity {
+        return;
+    }
+    *counter += 1;
+    if *counter < 60 {
+        return;
+    }
+    *counter = 0;
+    let below = [pos[0], pos[1] - 1, pos[2]];
+    let name = ctx.block_name_at(below);
+    if let Some(next) = crush_step(&name) {
+        ctx.set_block_by_name(below, next);
+    }
+}
+
+
 // ---- hand hook handlers ------------------------------------------------------
 
 /// native_block_entity: attach a kinetic block entity to every Create
@@ -13575,7 +13657,11 @@ pub fn hook_block_entity(block: &str, entity: &mut Option<(String, horizon_world
 
 /// native_block_entity_tick: register the position in the network, advance
 /// the rotation angle from the network's speed.
-pub fn hook_block_entity_tick(pos: [i32; 3], entity: &mut horizon_client::containers::ModBlockEntity) {
+pub fn hook_block_entity_tick(
+    game: &mut crate::game::Game<'_>,
+    pos: [i32; 3],
+    entity: &mut horizon_client::containers::ModBlockEntity,
+) {
     if entity.id != "create:kinetic" {
         return;
     }
@@ -13590,6 +13676,25 @@ pub fn hook_block_entity_tick(pos: [i32; 3], entity: &mut horizon_client::contai
     // angle in 1/100 rpm-ticks, persisted in the BE's data
     let old = entity.data.first().copied().unwrap_or(0);
     entity.data = vec![old.wrapping_add((rpm * dir as f32) as i32)];
+    // Consumers process the world (crushing chain) while the network spins.
+    let name = entity
+        .nbt
+        .get(&key)
+        .and_then(|t| match t {
+            horizon_world::nbt::Tag::String(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if kinetic_kind(&name) == Some(KinKind::Consumer) {
+        let mut ctx = BridgeCtx::new(GameRef::Game(game), String::new());
+        let mut counter = entity.data.get(1).copied().unwrap_or(0);
+        consumer_tick(&mut ctx, pos, &mut counter);
+        if entity.data.len() < 2 {
+            entity.data.push(counter);
+        } else {
+            entity.data[1] = counter;
+        }
+    }
 }
 
 /// native_right_click_block: report the network's state at this position.
@@ -13605,4 +13710,11 @@ pub fn hook_right_click(game: &mut crate::game::Game<'_>, pos: [i32; 3], _face: 
         rpm.abs()
     );
     game.native_chat(&msg);
+}
+
+/// native_tooltip: Create's summaries for the kinetic items.
+pub fn hook_tooltip(stack: &horizon_client::items::ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+    if let Some(summary) = tooltip_summary(&stack.item) {
+        lines.push((horizon_client::text::Text::literal(summary), 14540253));
+    }
 }
