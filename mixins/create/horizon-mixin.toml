@@ -14,6 +14,13 @@ name = "create"
 source = "mod.rs"
 
 [[injection]]
+id = "create_hook_mods"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+helper = "hook_mods.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }, { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "mods" }]
+# j2h: the mod's entry in Options > Mods
+[[injection]]
 id = "create_hook_0"
 kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_right_click_block"

@@ -13019,6 +13019,17 @@ fn ctx_dimension(_hook: &str) -> String {
     String::new()
 }
 
+// # j2h: the mod's entry in Options > Mods
+pub fn hook_mods(game: &mut crate::game::Game<'_>, mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+    // Options > Mods row for this mod.
+    mods.push(crate::game::native_hooks::NativeMod {
+        id: "create".into(),
+        title: format!("Create {} (native j2h)", "6.0.10"),
+        description: "Java Create 6.0.10, transpiled to native Rust by j2h".into(),
+        keys: Vec::new(),
+    });
+}
+
 // # source: fabric event net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$RightClickBlock → lambda com/simibubi/create/content/kinetics/mechanicalArm/ArmInteractionPointHandler::rightClickingBlocksSelectsThem (decoded)
 pub fn hook_0(game: &mut crate::game::Game<'_>, pos: [i32; 3], face: [i32; 3], canceled: &mut bool) {
     let mut ctx = BridgeCtx::new(
