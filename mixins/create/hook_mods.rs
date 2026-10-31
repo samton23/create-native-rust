@@ -1,5 +1,9 @@
 // j2h: the mod's entry in Options > Mods (official_minimap pattern).
-fn hook_mods(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+fn hook_mods(
+    game: &mut crate::game::Game<'_>,
+    mods: &mut Vec<crate::game::native_hooks::NativeMod>,
+) {
+    let _ = game;
     mods.push(crate::game::native_hooks::NativeMod {
         id: "create".into(),
         title: format!("Create {} (native j2h)", "6.0.10"),
