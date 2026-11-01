@@ -243,3 +243,57 @@ pub fn consumer_tick(ctx: &mut BridgeCtx, pos: [i32; 3], counter: &mut i32) {
         ctx.set_block_by_name(below, next);
     }
 }
+
+
+// ============================================================================
+// v0.4: the Ponder guide — a right-clickable block whose native screen shows
+// Create's Ponder pages (header + texts from the mod's lang data).
+// ============================================================================
+
+pub const GUIDE_BLOCK: &str = "create:ponder";
+
+/// Which block's screen the guide is. Horizon asks per block entity.
+pub fn guide_screen_attach(block: &str, screen: &mut Option<crate::game::native_hooks::NativeScreen>) {
+    if block == GUIDE_BLOCK {
+        *screen = Some(crate::game::native_hooks::NativeScreen {
+            width: 176.0,
+            height: 166.0,
+            slots: Vec::new(),
+            inventory_y: 166.0,
+            inventory_x: 8.0,
+            own_labels: true,
+        });
+    }
+}
+
+/// One subject per page: header + wrapped text lines, GUI-pixel layout.
+pub fn guide_page(page: usize) -> (&'static str, Vec<&'static str>) {
+    let idx = page % GUIDE.len();
+    let (subject, header, texts) = GUIDE[idx];
+    let mut lines: Vec<&'static str> = vec![header];
+    for t in texts.iter() {
+        // hard wrap at ~40 chars for the 176-wide screen
+        let mut line = String::new();
+        for w in t.split(' ') {
+            if line.chars().count() + w.chars().count() + 1 > 40 {
+                lines.push(Box::leak(line.clone().into_boxed_str()) as &'static str);
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(w);
+        }
+        if !line.is_empty() {
+            lines.push(Box::leak(line.into_boxed_str()) as &'static str);
+        }
+        lines.push("");
+    }
+    lines.push(Box::leak(format!("{}. {}", idx + 1, subject).into_boxed_str()) as &'static str);
+    (subject, lines)
+}
+
+pub fn guide_page_of(data: &[i32]) -> usize {
+    let raw = data.first().copied().unwrap_or(0);
+    (raw.max(0) as usize) % GUIDE.len()
+}

@@ -13638,6 +13638,75 @@ pub fn consumer_tick(ctx: &mut BridgeCtx, pos: [i32; 3], counter: &mut i32) {
 }
 
 
+// ============================================================================
+// v0.4: the Ponder guide — a right-clickable block whose native screen shows
+// Create's Ponder pages (header + texts from the mod's lang data).
+// ============================================================================
+
+pub const GUIDE_BLOCK: &str = "create:ponder";
+
+/// Which block's screen the guide is. Horizon asks per block entity.
+pub fn guide_screen_attach(block: &str, screen: &mut Option<crate::game::native_hooks::NativeScreen>) {
+    if block == GUIDE_BLOCK {
+        *screen = Some(crate::game::native_hooks::NativeScreen {
+            width: 176.0,
+            height: 166.0,
+            slots: Vec::new(),
+            inventory_y: 166.0,
+            inventory_x: 8.0,
+            own_labels: true,
+        });
+    }
+}
+
+/// One subject per page: header + wrapped text lines, GUI-pixel layout.
+pub fn guide_page(page: usize) -> (&'static str, Vec<&'static str>) {
+    let idx = page % GUIDE.len();
+    let (subject, header, texts) = GUIDE[idx];
+    let mut lines: Vec<&'static str> = vec![header];
+    for t in texts.iter() {
+        // hard wrap at ~40 chars for the 176-wide screen
+        let mut line = String::new();
+        for w in t.split(' ') {
+            if line.chars().count() + w.chars().count() + 1 > 40 {
+                lines.push(Box::leak(line.clone().into_boxed_str()) as &'static str);
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(w);
+        }
+        if !line.is_empty() {
+            lines.push(Box::leak(line.into_boxed_str()) as &'static str);
+        }
+        lines.push("");
+    }
+    lines.push(Box::leak(format!("{}. {}", idx + 1, subject).into_boxed_str()) as &'static str);
+    (subject, lines)
+}
+
+pub fn guide_page_of(data: &[i32]) -> usize {
+    let raw = data.first().copied().unwrap_or(0);
+    (raw.max(0) as usize) % GUIDE.len()
+}
+
+
+// === CREATE :: PONDER GUIDE DATA (from Create's en_us.json) ===
+// Ponder guide pages, curated from Create's en_us.json (create.ponder.*).
+pub static GUIDE: &[(&str, &str, &[&str])] = &[
+    ("shaft", "Relaying rotational force using Shafts", &["Shafts will relay rotation in a straight line."]),
+    ("cogwheel", "Relaying rotational force using Cogwheels", &["Cogwheels will relay rotation to other adjacent cogwheels", "Neighbouring shafts connected like this will rotate in opposite directions"]),
+    ("large_cogwheel", "Relaying rotational force using Large Cogwheels", &["Large cogwheels can connect to each other at right angles", "It will help relaying conveyed speed to other axes of rotation"]),
+    ("gearbox", "Relaying rotational force using Gearboxes", &["Jumping between axes of rotation can get bulky quickly", "A gearbox is the more compact equivalent of this setup", "Shafts around corners rotate in mirrored directions", "Straight connections will be reversed"]),
+    ("water_wheel", "Generating Rotational Force using Water Wheels", &["Water Wheels draw force from adjacent Water Currents", "Covering additional sides will not improve its kinetic output further", "Use wood planks on the wheel to change its appearance"]),
+    ("steam_engine", "Setting up Steam Engines", &["Steam Engines can be placed on a Fluid Tank", "Clicking the engine with a Shaft creates the Kinetic Output", "With sufficient Heat, Water and Boiler space...", "...they will generate Rotational Force", "The minimal setup requires 4 Fluid Tanks", "With the help of Blaze Burners, the power output can be increased", "Higher power levels require more Water, Size and Heat", "The boiler's current power level can be inspected with Engineer's Goggles", "With each added power level, an additional Engine can output at full capacity", "Lvl 4", "4 Engines", "Lvl 8", "8 Engines"]),
+    ("millstone", "Processing Items in the Millstone", &["Millstones process items by grinding them", "They can be powered from the side using cogwheels", "Throw or Insert items at the top", "After some time, the result can be obtained via Right-click", "The outputs can also be extracted by automation"]),
+    ("mechanical_drill", "Breaking Blocks with the Mechanical Drill", &["When given Rotational Force, a Mechanical Drill will break blocks directly in front of it", "Its mining speed depends on the Rotational Input"]),
+    ("deployer", "Using the Deployer", &["Given Rotational Force, a Deployer can imitate player interactions", "It will always interact with the position 2 blocks in front of itself", "Blocks directly in front will not obstruct it", "Deployers can:", "Place Blocks,", "Use Items,", "Activate Blocks,", "Harvest blocks", "and Attack Mobs", "Right-click the front to give it an Item to use", "Items can also be inserted automatically", "Deployers carry a filter slot", "When a filter is set, it activates only while holding a matching item", "Only items matching the filter can now be inserted...", "...and only non-matching items will be extracted"]),
+    ("mechanical_press", "Processing Items with the Mechanical Press", &["The Mechanical Press can process items provided beneath it", "The Input items can be dropped or placed on a Depot under the Press", "When items are provided on a belt...", "The Press will hold and process them automatically"]),
+];
+
 // ---- hand hook handlers ------------------------------------------------------
 
 /// native_block_entity: attach a kinetic block entity to every Create
@@ -13653,10 +13722,15 @@ pub fn hook_block_entity(block: &str, entity: &mut Option<(String, horizon_world
             *entity = Some(("create:kinetic".into(), nbt));
         }
     }
+    // The guide block gets its own block entity (its page index rides the
+    // data slots to the client).
+    if block == GUIDE_BLOCK && entity.is_none() {
+        *entity = Some(("create:guide".into(), horizon_world::nbt::Compound::new()));
+    }
 }
 
 /// native_block_entity_tick: register the position in the network, advance
-/// the rotation angle from the network's speed.
+/// the rotation angle, and run consumer processing (crushing chain).
 pub fn hook_block_entity_tick(
     game: &mut crate::game::Game<'_>,
     pos: [i32; 3],
@@ -13665,18 +13739,17 @@ pub fn hook_block_entity_tick(
     if entity.id != "create:kinetic" {
         return;
     }
-    // Remember the block name on first tick (the attach hook has no pos).
     let key = horizon_world::nbt::JavaString::from("j2h:block");
     if let Some(horizon_world::nbt::Tag::String(b)) = entity.nbt.get(&key) {
         let leaked: &'static str = Box::leak(b.to_string_lossy().into_boxed_str());
         net_attach(pos, leaked);
     }
     net_recompute();
-    let (rpm, dir, _demand, _capacity) = net_speed(pos);
-    // angle in 1/100 rpm-ticks, persisted in the BE's data
+    let (rpm, dir, demand, capacity) = net_speed(pos);
     let old = entity.data.first().copied().unwrap_or(0);
     entity.data = vec![old.wrapping_add((rpm * dir as f32) as i32)];
-    // Consumers process the world (crushing chain) while the network spins.
+
+    // Consumers grind the block beneath them while the network spins.
     let name = entity
         .nbt
         .get(&key)
@@ -13698,7 +13771,12 @@ pub fn hook_block_entity_tick(
 }
 
 /// native_right_click_block: report the network's state at this position.
-pub fn hook_right_click(game: &mut crate::game::Game<'_>, pos: [i32; 3], _face: [i32; 3], _canceled: &mut bool) {
+pub fn hook_right_click(
+    game: &mut crate::game::Game<'_>,
+    pos: [i32; 3],
+    _face: [i32; 3],
+    _canceled: &mut bool,
+) {
     let (rpm, dir, demand, capacity) = net_speed(pos);
     let arrow = match dir {
         d if d < 0 => "\u{21ba}",
@@ -13713,8 +13791,56 @@ pub fn hook_right_click(game: &mut crate::game::Game<'_>, pos: [i32; 3], _face: 
 }
 
 /// native_tooltip: Create's summaries for the kinetic items.
-pub fn hook_tooltip(stack: &horizon_client::items::ItemStack, lines: &mut Vec<(horizon_client::text::Text, u32)>) {
+pub fn hook_tooltip(
+    stack: &horizon_client::items::ItemStack,
+    lines: &mut Vec<(horizon_client::text::Text, u32)>,
+) {
     if let Some(summary) = tooltip_summary(&stack.item) {
         lines.push((horizon_client::text::Text::literal(summary), 14540253));
+    }
+}
+
+/// native_screen: the guide block opens the Ponder screen.
+pub fn hook_guide_screen(block: &str, screen: &mut Option<crate::game::native_hooks::NativeScreen>) {
+    guide_screen_attach(block, screen);
+}
+
+/// native_screen_draw data: (title, wrapped lines) of the current page.
+pub fn hook_guide_draw(data: &[i32]) -> (String, Vec<String>) {
+    let page = guide_page_of(data);
+    let (_subject, lines) = guide_page(page);
+    (
+        format!("Create \u{2014} Ponder {}/{}", page + 1, GUIDE.len()),
+        lines.into_iter().map(str::to_string).collect(),
+    )
+}
+
+/// native_screen_click: page-turn zones -> menu button ids.
+pub fn hook_guide_click(at: [f32; 2]) -> Option<i32> {
+    let (x, y) = (at[0], at[1]);
+    if (8.0..24.0).contains(&x) && (140.0..156.0).contains(&y) {
+        return Some(0); // prev page
+    }
+    if (152.0..168.0).contains(&x) && (140.0..156.0).contains(&y) {
+        return Some(1); // next page
+    }
+    None
+}
+
+/// native_menu_button (server): turn the page in the BE's data slots.
+pub fn hook_guide_menu_button(entity: &mut horizon_client::containers::ModBlockEntity, id: i32) {
+    if entity.id != "create:guide" {
+        return;
+    }
+    let page = entity.data.first().copied().unwrap_or(0);
+    let next = match id {
+        0 => page - 1,
+        1 => page + 1,
+        _ => page,
+    };
+    if entity.data.is_empty() {
+        entity.data.push(next);
+    } else {
+        entity.data[0] = next;
     }
 }
